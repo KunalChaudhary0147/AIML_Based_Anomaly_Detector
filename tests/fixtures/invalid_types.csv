@@ -1,0 +1,2 @@
+timestamp,station_id,temperature,humidity,wind_speed,atmospheric_pressure,is_anomaly
+not-a-time,STATION_001,hot,50.0,3.0,1012.0,maybe

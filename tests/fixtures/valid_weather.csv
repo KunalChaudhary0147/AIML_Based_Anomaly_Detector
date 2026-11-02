@@ -1,0 +1,3 @@
+timestamp,station_id,temperature,humidity,wind_speed,atmospheric_pressure,is_anomaly
+2025-01-01T00:00:00Z,001,10.0,50.0,3.0,1012.0,false
+2025-01-01T01:00:00Z,STATION_002,55.0,135.0,70.0,850.0,true

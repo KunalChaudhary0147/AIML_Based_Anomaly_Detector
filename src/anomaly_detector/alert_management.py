@@ -47,6 +47,7 @@ class Alert:
     status: str
     created_at_utc: str
     updated_at_utc: str
+    dataset_id: str | None = None
 
 
 def _method(result) -> str:
@@ -91,6 +92,7 @@ def generate_alerts(results: Iterable[GenericDetectionResult | AdvancedDetection
             status="NEW",
             created_at_utc=now,
             updated_at_utc=now,
+            dataset_id=record.dataset_id,
         ))
     return alerts
 
@@ -113,10 +115,11 @@ def persist_alerts(database_path, alerts: Iterable[Alert]) -> int:
                     alert_id, detection_identity, detection_method, metric_name, entity_id,
                     source_type, observed_value, severity, explanation, status,
                     created_at_utc, updated_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    , dataset_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (alert.alert_id, alert.detection_identity, alert.detection_method, alert.metric_name,
                  alert.entity_id, alert.source_type, alert.observed_value, alert.severity,
-                 alert.explanation, alert.status, alert.created_at_utc, alert.updated_at_utc),
+                 alert.explanation, alert.status, alert.created_at_utc, alert.updated_at_utc, alert.dataset_id),
             )
             inserted += int(cursor.rowcount == 1)
         connection.commit()
@@ -130,7 +133,7 @@ def persist_alerts(database_path, alerts: Iterable[Alert]) -> int:
     return inserted
 
 
-def retrieve_alerts(database_path, *, severity=None, status=None, metric_name=None, entity_id=None) -> list[Alert]:
+def retrieve_alerts(database_path, *, severity=None, status=None, metric_name=None, entity_id=None, dataset_ids=None) -> list[Alert]:
     """Retrieve alerts with optional filters in creation order."""
     for value, name in ((severity, "severity"), (status, "status"), (metric_name, "metric_name"), (entity_id, "entity_id")):
         if value is not None and (not isinstance(value, str) or not value.strip()):
@@ -143,6 +146,11 @@ def retrieve_alerts(database_path, *, severity=None, status=None, metric_name=No
     for column, value in (("severity", severity), ("status", status), ("metric_name", metric_name), ("entity_id", entity_id)):
         if value is not None:
             clauses.append(f"{column} = ?"); params.append(value)
+    if dataset_ids is not None:
+        if not isinstance(dataset_ids, (list, tuple)) or any(not isinstance(item, str) or not item.strip() for item in dataset_ids):
+            raise DataValidationError("dataset_ids must be a list of dataset IDs or None.")
+        clauses.append("1 = 0" if not dataset_ids else f"dataset_id IN ({','.join('?' for _ in dataset_ids)})")
+        params.extend(dataset_ids)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     connection = None
     try:

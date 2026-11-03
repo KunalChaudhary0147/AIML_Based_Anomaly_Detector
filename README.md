@@ -131,7 +131,7 @@ Start the API from the project root with:
 
 Set `ANOMALY_DATABASE_PATH` to select the SQLite database; otherwise the API uses `data/telemetry.sqlite`. No AWS credentials or AWS calls are required. Interactive documentation is available at `/docs`.
 
-Available endpoint groups include `/health`, `/api/v1/ingestion/csv`, `/api/v1/telemetry`, `/api/v1/detection/generic`, `/api/v1/detection/advanced`, `/api/v1/detection/generic/results`, `/api/v1/detection/advanced/results`, `/api/v1/alerts`, `/api/v1/configurations`, and CSV export endpoints under `/api/v1/export/`.
+Available endpoint groups include `/health`, `/api/v1/ingestion/csv`, `/api/v1/telemetry`, `/api/v1/overview`, `/api/v1/catalog`, `/api/v1/detection/generic`, `/api/v1/detection/advanced`, `/api/v1/detection/generic/results`, `/api/v1/detection/advanced/results`, `/api/v1/alerts`, `/api/v1/configurations`, `/api/v1/datasets`, and CSV export endpoints under `/api/v1/export/`. Dataset-aware endpoints accept repeated `dataset_ids` query parameters; an explicit empty selection is represented internally by `dataset_ids=__none__`.
 
 ## Phase 5 infrastructure CSV ingestion
 

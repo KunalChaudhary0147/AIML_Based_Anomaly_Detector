@@ -3,10 +3,14 @@ from importlib import import_module
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from anomaly_detector.api import create_app
 from anomaly_detector.data_ingestion.telemetry import TelemetryRecord
 from anomaly_detector.data_ingestion.telemetry_persistence import persist_telemetry_records
+
+
+FRONTEND_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")
 
 
 def test_documented_uvicorn_target_exposes_asgi_app():
@@ -33,7 +37,7 @@ def test_health_csv_ingestion_and_telemetry(tmp_path):
     seed_database(database)
     telemetry = client.get("/api/v1/telemetry", params={"metric_name": "cpu"})
     assert telemetry.status_code == 200
-    assert len(telemetry.json()) == 2
+    assert len(telemetry.json()) == 3
 
 
 def test_detection_alert_configuration_and_exports(tmp_path):
@@ -58,7 +62,57 @@ def test_detection_alert_configuration_and_exports(tmp_path):
     assert "predicted_is_anomaly" in export.text
 
 
+def test_empty_overview_and_configuration_lifecycle(tmp_path):
+    client = TestClient(create_app(tmp_path / "api.sqlite"))
+    overview = client.get("/api/v1/overview")
+    assert overview.status_code == 200
+    assert overview.json()["totals"] == {
+        "telemetry_records": 0,
+        "anomalies": 0,
+        "normal_observations": 0,
+        "anomalous_observations": 0,
+        "total_metrics": 0,
+        "active_alerts": 0,
+        "critical_alerts": 0,
+        "monitored_entities": 0,
+    }
+    assert overview.json()["observation_split"] == []
+    saved = client.post(
+        "/api/v1/configurations",
+        json={"name": "temporary", "thresholds": {"cpu": {"lower": 0, "upper": 80}}},
+    )
+    assert saved.status_code == 200
+    assert client.get("/api/v1/configurations").json()[0]["name"] == "temporary"
+    assert client.delete("/api/v1/configurations/temporary").status_code == 200
+    assert client.get("/api/v1/configurations").json() == []
+
+
+def test_overview_classification_and_explicit_empty_dataset_filter(tmp_path):
+    database = tmp_path / "api.sqlite"
+    persist_telemetry_records(database, [
+        TelemetryRecord(datetime(2026, 11, 2, 12, tzinfo=timezone.utc), "csv", "cpu", 20.0, entity_id="host-a", is_anomaly=False),
+        TelemetryRecord(datetime(2026, 11, 2, 13, tzinfo=timezone.utc), "csv", "cpu", 95.0, entity_id="host-a", is_anomaly=True),
+    ])
+    client = TestClient(create_app(database))
+    overview = client.get("/api/v1/overview").json()
+    assert overview["totals"]["normal_observations"] == 1
+    assert overview["totals"]["anomalous_observations"] == 1
+    assert overview["observation_split"][0]["normal"] == 1
+    assert overview["observation_split"][0]["anomalous"] == 1
+    filtered = client.get("/api/v1/telemetry", params=[("dataset_ids", "__none__")])
+    assert filtered.status_code == 200
+    assert filtered.json() == []
+
+
 def test_invalid_api_input_returns_client_error(tmp_path):
     client = TestClient(create_app(tmp_path / "api.sqlite"))
     response = client.post("/api/v1/detection/generic", json={"thresholds": {"cpu": {"lower": 10, "upper": 0}}})
     assert response.status_code in {400, 422}
+
+
+@pytest.mark.parametrize("origin", FRONTEND_ORIGINS)
+def test_frontend_origins_receive_cors_header(tmp_path, origin):
+    client = TestClient(create_app(tmp_path / "api.sqlite"))
+    response = client.get("/health", headers={"Origin": origin})
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin

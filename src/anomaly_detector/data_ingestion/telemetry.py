@@ -41,6 +41,7 @@ class TelemetryRecord:
     region: str | None = None
     period: int | None = None
     statistic: str | None = None
+    dataset_id: str | None = None
 
     def __post_init__(self) -> None:
         """Validate and normalize the record without mutating caller data."""
@@ -55,7 +56,7 @@ class TelemetryRecord:
         object.__setattr__(self, "metric_value", numeric_value)
 
         for field_name in (
-            "metric_unit", "entity_id", "namespace", "resource_arn", "account_id", "region", "statistic",
+            "metric_unit", "entity_id", "namespace", "resource_arn", "account_id", "region", "statistic", "dataset_id",
         ):
             value = getattr(self, field_name)
             if value is not None:
@@ -123,8 +124,9 @@ class TelemetryRecord:
     @property
     def datapoint_identity(self) -> tuple[object, ...]:
         """Return time-series identity plus aggregation and UTC timestamp."""
-        return self.time_series_identity + (
+        identity = self.time_series_identity + (
             self.timestamp,
             self.period,
             self.statistic,
         )
+        return identity if self.dataset_id is None else identity + (self.dataset_id,)

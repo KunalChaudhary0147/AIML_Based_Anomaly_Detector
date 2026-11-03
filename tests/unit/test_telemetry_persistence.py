@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 
 import pytest
@@ -129,6 +130,26 @@ def test_database_reopening_preserves_records(tmp_path):
     persist_telemetry_records(path, [record])
     assert retrieve_telemetry_records(path) == [record]
     assert persist_telemetry_records(path, [record]).already_existing == 1
+
+
+def test_concurrent_reads_and_writes_complete_without_lock_errors(tmp_path):
+    path = tmp_path / "concurrent.sqlite"
+    records = [
+        make_record(timestamp=datetime(2026, 10, 25, hour, tzinfo=timezone.utc), entity_id=f"i-{hour}")
+        for hour in range(8)
+    ]
+
+    def write_and_read(record):
+        result = persist_telemetry_records(path, [record])
+        return result.inserted, len(retrieve_telemetry_records(path))
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(write_and_read, records))
+
+    assert sum(inserted for inserted, _ in results) == len(records)
+    assert len(retrieve_telemetry_records(path)) == len(records)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
 def test_conflict_event_retrieval_is_ordered_and_complete(tmp_path):

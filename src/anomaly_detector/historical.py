@@ -25,7 +25,7 @@ def _utc_filter(value: datetime | None, name: str) -> str | None:
     return value.astimezone(timezone.utc).isoformat()
 
 
-def _query_filters(start, end, metric_name, entity_id, source_type, anomaly):
+def _query_filters(start, end, metric_name, entity_id, source_type, anomaly, dataset_ids=None):
     start_text = _utc_filter(start, "start")
     end_text = _utc_filter(end, "end")
     if start_text is not None and end_text is not None and start_text > end_text:
@@ -50,6 +50,14 @@ def _query_filters(start, end, metric_name, entity_id, source_type, anomaly):
     if anomaly is not None:
         clauses.append("is_anomaly = ?")
         parameters.append(int(anomaly))
+    if dataset_ids is not None:
+        if not isinstance(dataset_ids, (list, tuple)) or any(not isinstance(item, str) or not item.strip() for item in dataset_ids):
+            raise DataValidationError("dataset_ids must be a non-empty list of dataset IDs or None.")
+        if not dataset_ids:
+            clauses.append("1 = 0")
+        else:
+            clauses.append(f"dataset_id IN ({','.join('?' for _ in dataset_ids)})")
+            parameters.extend(dataset_ids)
     return clauses, parameters
 
 
@@ -68,13 +76,13 @@ def _telemetry_from_row(row) -> TelemetryRecord:
         entity_id=row["entity_id"], is_anomaly=None if row["is_anomaly"] is None else bool(row["is_anomaly"]),
         namespace=row["namespace"], dimensions=json.loads(row["dimensions_json"]),
         resource_arn=row["resource_arn"], account_id=row["account_id"], region=row["region"],
-        period=row["period"], statistic=row["statistic"],
+        period=row["period"], statistic=row["statistic"], dataset_id=row["dataset_id"],
     )
 
 
-def retrieve_telemetry_history(database_path, *, start=None, end=None, metric_name=None, entity_id=None, source_type=None, anomaly=None):
+def retrieve_telemetry_history(database_path, *, start=None, end=None, metric_name=None, entity_id=None, source_type=None, anomaly=None, dataset_ids=None):
     """Retrieve telemetry records in deterministic UTC timestamp order."""
-    clauses, parameters = _query_filters(start, end, metric_name, entity_id, source_type, anomaly)
+    clauses, parameters = _query_filters(start, end, metric_name, entity_id, source_type, anomaly, dataset_ids)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     connection = None
     try:
@@ -109,6 +117,7 @@ def _retrieve_detection_rows(database_path, table, where, parameters, advanced):
             namespace=row["namespace"], dimensions=json.loads(row["dimensions_json"]),
             account_id=row["account_id"], region=row["region"], resource_arn=row["resource_arn"],
             metric_unit=row["metric_unit"], period=row["period"], statistic=row["statistic"],
+            dataset_id=row["dataset_id"],
         )
         if advanced:
             results.append(AdvancedDetectionResult(record, bool(row["predicted_is_anomaly"]), row["explanation"], row["detection_method"], row["metric_value"], row["reference_value"], row["statistical_score"]))
@@ -121,10 +130,11 @@ def _detection_filters(filters, advanced):
     start, end = filters.pop("start", None), filters.pop("end", None)
     metric_name, entity_id = filters.pop("metric_name", None), filters.pop("entity_id", None)
     source_type, anomaly = filters.pop("source_type", None), filters.pop("anomaly", None)
+    dataset_ids = filters.pop("dataset_ids", None)
     method = filters.pop("detection_method", None) if advanced else None
     if filters:
         raise DataValidationError(f"Unsupported filters: {sorted(filters)}")
-    clauses, parameters = _query_filters(start, end, metric_name, entity_id, source_type, None)
+    clauses, parameters = _query_filters(start, end, metric_name, entity_id, source_type, None, dataset_ids)
     if anomaly is not None:
         if not isinstance(anomaly, bool):
             raise DataValidationError("anomaly must be Boolean or None.")

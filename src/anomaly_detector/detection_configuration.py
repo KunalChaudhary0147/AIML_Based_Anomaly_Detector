@@ -97,3 +97,47 @@ def load_detection_configuration(database_path, name: str) -> DetectionConfigura
 	)
 	config.validate()
 	return config
+
+
+def list_detection_configurations(database_path) -> list[dict]:
+	"""Return persisted configuration payloads and update timestamps."""
+	initialize_database(database_path)
+	connection = _connect(database_path)
+	try:
+		rows = connection.execute(
+			"SELECT name, payload_json, updated_at_utc FROM detection_configurations ORDER BY name"
+		).fetchall()
+	finally:
+		connection.close()
+	result = []
+	for row in rows:
+		payload = json.loads(row["payload_json"])
+		config = DetectionConfiguration(
+			name=payload["name"],
+			thresholds={key: NumericThreshold(**value) for key, value in payload["thresholds"].items()},
+			z_score_sensitivity=payload["z_score_sensitivity"],
+			rolling_window_size=payload["rolling_window_size"],
+			multivariate_sensitivity=payload["multivariate_sensitivity"],
+			severity_policy=SeverityPolicy(**payload["severity_policy"]),
+		)
+		config.validate()
+		result.append({
+			"id": row["name"],
+			"updated_at": row["updated_at_utc"],
+			"configuration": config,
+		})
+	return result
+
+
+def delete_detection_configuration(database_path, name: str) -> None:
+	if not isinstance(name, str) or not name.strip():
+		raise DataValidationError("Configuration name must be non-empty.")
+	initialize_database(database_path)
+	connection = _connect(database_path)
+	try:
+		cursor = connection.execute("DELETE FROM detection_configurations WHERE name = ?", (name,))
+		connection.commit()
+	finally:
+		connection.close()
+	if cursor.rowcount == 0:
+		raise DataValidationError(f"Detection configuration not found: {name}")

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import hashlib
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ from anomaly_detector.utils.exceptions import DataIngestionError, DataValidation
 SCHEMA_VERSION = 1
 CHECKPOINT_SCHEMA_VERSION = 1
 SQLITE_TIMEOUT_SECONDS = 5.0
+SQLITE_BUSY_TIMEOUT_MILLISECONDS = 30_000
 CHECKPOINT_STATES = frozenset({"pending", "running", "page_committed", "completed", "failed", "needs_recovery"})
 _VALID_STATE_TRANSITIONS = {
     "pending": {"running", "failed", "needs_recovery"},
@@ -125,7 +127,8 @@ CREATE TABLE IF NOT EXISTS telemetry_records (
     account_id TEXT,
     region TEXT,
     period INTEGER,
-    statistic TEXT
+    statistic TEXT,
+    dataset_id TEXT
 )
 """,
 """
@@ -194,7 +197,8 @@ CREATE TABLE IF NOT EXISTS generic_detection_results (
     metric_unit TEXT,
     period INTEGER,
     statistic TEXT,
-    created_at_utc TEXT NOT NULL
+    created_at_utc TEXT NOT NULL,
+    dataset_id TEXT
 )
 """,
 """
@@ -219,7 +223,8 @@ CREATE TABLE IF NOT EXISTS advanced_detection_results (
     metric_unit TEXT,
     period INTEGER,
     statistic TEXT,
-    created_at_utc TEXT NOT NULL
+    created_at_utc TEXT NOT NULL,
+    dataset_id TEXT
 )
 """,
 """
@@ -235,7 +240,8 @@ CREATE TABLE IF NOT EXISTS anomaly_alerts (
     explanation TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at_utc TEXT NOT NULL,
-    updated_at_utc TEXT NOT NULL
+    updated_at_utc TEXT NOT NULL,
+    dataset_id TEXT
 )
 """,
 """
@@ -245,6 +251,21 @@ CREATE TABLE IF NOT EXISTS detection_configurations (
     updated_at_utc TEXT NOT NULL
 )
 """,
+"""
+CREATE TABLE IF NOT EXISTS datasets (
+    dataset_id TEXT PRIMARY KEY,
+    filename TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    upload_timestamp_utc TEXT,
+    record_count INTEGER NOT NULL,
+    entity_count INTEGER NOT NULL,
+    metric_count INTEGER NOT NULL,
+    start_timestamp_utc TEXT,
+    end_timestamp_utc TEXT,
+    content_hash TEXT,
+    status TEXT NOT NULL
+)
+""",
 )
 
 _REQUIRED_COLUMNS = {
@@ -252,7 +273,7 @@ _REQUIRED_COLUMNS = {
     "telemetry_records": {
         "datapoint_identity", "time_series_identity", "schema_version", "timestamp_utc",
         "source_type", "metric_name", "metric_value", "metric_unit", "entity_id", "is_anomaly",
-        "namespace", "dimensions_json", "resource_arn", "account_id", "region", "period", "statistic",
+        "namespace", "dimensions_json", "resource_arn", "account_id", "region", "period", "statistic", "dataset_id",
     },
     "telemetry_conflicts": {
         "conflict_id", "datapoint_identity", "existing_metric_value", "incoming_metric_value",
@@ -273,25 +294,31 @@ _REQUIRED_COLUMNS = {
         "dimensions_json",
         "account_id", "region", "resource_arn", "metric_unit", "period", "statistic",
         "created_at_utc",
+        "dataset_id",
     },
     "advanced_detection_results": {
         "result_identity", "datapoint_identity", "metric_name", "timestamp_utc", "metric_value",
         "predicted_is_anomaly", "explanation", "detection_method", "reference_value", "statistical_score",
         "source_type", "entity_id", "namespace", "dimensions_json", "account_id", "region",
         "resource_arn", "metric_unit", "period", "statistic", "created_at_utc",
+        "dataset_id",
     },
     "anomaly_alerts": {
         "alert_id", "detection_identity", "detection_method", "metric_name", "entity_id",
         "source_type", "observed_value", "severity", "explanation", "status",
         "created_at_utc", "updated_at_utc",
+        "dataset_id",
     },
     "detection_configurations": {"name", "payload_json", "updated_at_utc"},
+    "datasets": {"dataset_id", "filename", "source_type", "upload_timestamp_utc", "record_count", "entity_count", "metric_count", "start_timestamp_utc", "end_timestamp_utc", "content_hash", "status"},
 }
-_CORE_TABLES = {"telemetry_schema", "telemetry_records", "telemetry_conflicts"}
+_CORE_TABLES = {"telemetry_schema", "telemetry_records", "telemetry_conflicts", "datasets"}
 _CHECKPOINT_TABLES = {"checkpoint_schema", "ingestion_checkpoints"}
 _RESULT_TABLES = {"generic_detection_results"}
 _ADVANCED_RESULT_TABLES = {"advanced_detection_results"}
 _ALERT_TABLES = {"anomaly_alerts", "detection_configurations"}
+_INITIALIZATION_LOCK = threading.RLock()
+_INITIALIZED_DATABASES: set[Path] = set()
 
 
 def _json_value(value: Any) -> Any:
@@ -321,7 +348,8 @@ def _connect(database_path: str | Path) -> sqlite3.Connection:
     if path.parent != Path(""):
         path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=SQLITE_TIMEOUT_SECONDS)
-    connection.execute(f"PRAGMA busy_timeout = {int(SQLITE_TIMEOUT_SECONDS * 1000)}")
+    connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MILLISECONDS}")
+    connection.execute("PRAGMA foreign_keys = ON")
     connection.row_factory = sqlite3.Row
     return connection
 
@@ -382,13 +410,46 @@ def _validate_schema(connection: sqlite3.Connection, *, require_checkpoints: boo
             )
 
 
-def initialize_database(database_path: str | Path) -> None:
+def _initialize_database_once(database_path: str | Path) -> None:
     """Create the telemetry and conflict tables if they do not exist."""
     connection: sqlite3.Connection | None = None
     try:
         connection = _connect(database_path)
         existing_tables = _table_names(connection)
         if existing_tables:
+            connection.execute("BEGIN IMMEDIATE")
+            migrations = {
+                "telemetry_records": "dataset_id TEXT",
+                "generic_detection_results": "dataset_id TEXT",
+                "advanced_detection_results": "dataset_id TEXT",
+                "anomaly_alerts": "dataset_id TEXT",
+            }
+            for table, definition in migrations.items():
+                if table in existing_tables and "dataset_id" not in {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN dataset_id {definition}")
+            for statement in _SCHEMA_STATEMENTS[3:]:
+                connection.execute(statement)
+            dataset_columns = {
+                row[1]: row[3]
+                for row in connection.execute("PRAGMA table_info(datasets)")
+            }
+            if dataset_columns.get("upload_timestamp_utc") == 1 or dataset_columns.get("content_hash") == 1:
+                connection.execute("ALTER TABLE datasets RENAME TO datasets_legacy_schema")
+                connection.execute(_SCHEMA_STATEMENTS[-1])
+                connection.execute(
+                    """INSERT INTO datasets (
+                        dataset_id, filename, source_type, upload_timestamp_utc,
+                        record_count, entity_count, metric_count, start_timestamp_utc,
+                        end_timestamp_utc, content_hash, status
+                    )
+                    SELECT dataset_id, filename, source_type, upload_timestamp_utc,
+                           record_count, entity_count, metric_count, start_timestamp_utc,
+                           end_timestamp_utc, content_hash, status
+                    FROM datasets_legacy_schema"""
+                )
+                connection.execute("DROP TABLE datasets_legacy_schema")
+            connection.commit()
+            existing_tables = _table_names(connection)
             _validate_schema(connection, require_checkpoints=False)
             if not _CHECKPOINT_TABLES.issubset(existing_tables) or not _RESULT_TABLES.issubset(existing_tables) or not _ADVANCED_RESULT_TABLES.issubset(existing_tables) or not _ALERT_TABLES.issubset(existing_tables):
                 connection.execute("BEGIN IMMEDIATE")
@@ -418,10 +479,34 @@ def initialize_database(database_path: str | Path) -> None:
     except sqlite3.Error as exc:
         if connection is not None:
             connection.rollback()
-        raise TelemetryPersistenceError(f"Unable to initialize telemetry database: {exc}") from exc
+        raise TelemetryPersistenceError(f"Unable to initialize telemetry database; transaction rolled back: {exc}") from exc
     finally:
         if connection is not None:
             connection.close()
+
+
+def initialize_database(database_path: str | Path) -> None:
+    """Initialize or migrate one database once per process."""
+    path = Path(database_path).resolve()
+    with _INITIALIZATION_LOCK:
+        if path in _INITIALIZED_DATABASES:
+            connection = _connect(path)
+            try:
+                try:
+                    _validate_schema(connection)
+                except TelemetryPersistenceError:
+                    _INITIALIZED_DATABASES.remove(path)
+                else:
+                    return
+            finally:
+                connection.close()
+        connection = _connect(path)
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+        finally:
+            connection.close()
+        _initialize_database_once(path)
+        _INITIALIZED_DATABASES.add(path)
 
 
 def persist_telemetry_records(
@@ -502,13 +587,13 @@ def persist_telemetry_records_in_connection(
                 datapoint_identity, time_series_identity, schema_version,
                 timestamp_utc, source_type, metric_name, metric_value, metric_unit,
                 entity_id, is_anomaly, namespace, dimensions_json, resource_arn,
-                account_id, region, period, statistic
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                account_id, region, period, statistic, dataset_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (identity, _identity_json(record.time_series_identity), SCHEMA_VERSION,
              _timestamp_text(record.timestamp), record.source_type, record.metric_name,
              record.metric_value, record.metric_unit, record.entity_id, _label_value(record.is_anomaly),
              record.namespace, json.dumps(dict(record.dimensions), sort_keys=True, separators=(",", ":")),
-             record.resource_arn, record.account_id, record.region, record.period, record.statistic),
+             record.resource_arn, record.account_id, record.region, record.period, record.statistic, record.dataset_id),
         )
         inserted += 1
     return PersistenceResult(inserted, already_existing, conflicts)
@@ -545,6 +630,7 @@ def retrieve_telemetry_records(database_path: str | Path) -> list[TelemetryRecor
             region=row["region"],
             period=row["period"],
             statistic=row["statistic"],
+            dataset_id=row["dataset_id"],
         )
         for row in rows
     ]
@@ -610,14 +696,14 @@ def persist_generic_detection_results(
                         datapoint_identity, metric_name, timestamp_utc, metric_value,
                         predicted_is_anomaly, explanation, source_type, entity_id, namespace,
                         dimensions_json, account_id, region, resource_arn, metric_unit,
-                        period, statistic, created_at_utc
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        period, statistic, created_at_utc, dataset_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (identity, record.metric_name, _timestamp_text(record.timestamp), record.metric_value,
                      int(result.predicted_is_anomaly), result.explanation, record.source_type,
                      record.entity_id, record.namespace,
                      json.dumps(dict(record.dimensions), sort_keys=True, separators=(",", ":")),
                      record.account_id, record.region, record.resource_arn, record.metric_unit,
-                     record.period, record.statistic, datetime.now(timezone.utc).isoformat()),
+                     record.period, record.statistic, datetime.now(timezone.utc).isoformat(), record.dataset_id),
                 )
                 if cursor.rowcount == 1:
                     inserted += 1
@@ -680,6 +766,7 @@ def retrieve_generic_detection_results(
                 namespace=row["namespace"], dimensions=json.loads(row["dimensions_json"]),
                 account_id=row["account_id"], region=row["region"], resource_arn=row["resource_arn"],
                 metric_unit=row["metric_unit"], period=row["period"], statistic=row["statistic"],
+                dataset_id=row["dataset_id"],
             ),
             predicted_is_anomaly=bool(row["predicted_is_anomaly"]),
             explanation=row["explanation"],
@@ -716,15 +803,15 @@ def persist_advanced_detection_results(
                         metric_value, predicted_is_anomaly, explanation, detection_method,
                         reference_value, statistical_score, source_type, entity_id, namespace,
                         dimensions_json, account_id, region, resource_arn, metric_unit,
-                        period, statistic, created_at_utc
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        period, statistic, created_at_utc, dataset_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (result_identity, datapoint_identity, record.metric_name, _timestamp_text(record.timestamp),
                      record.metric_value, int(result.predicted_is_anomaly), result.explanation,
                      result.detection_method, result.reference_value, result.statistical_score,
                      record.source_type, record.entity_id, record.namespace,
                      json.dumps(dict(record.dimensions), sort_keys=True, separators=(",", ":")),
                      record.account_id, record.region, record.resource_arn, record.metric_unit,
-                     record.period, record.statistic, datetime.now(timezone.utc).isoformat()),
+                     record.period, record.statistic, datetime.now(timezone.utc).isoformat(), record.dataset_id),
                 )
                 inserted += int(cursor.rowcount == 1)
                 already_existing += int(cursor.rowcount != 1)
@@ -786,6 +873,7 @@ def retrieve_advanced_detection_results(
                 namespace=row["namespace"], dimensions=json.loads(row["dimensions_json"]),
                 account_id=row["account_id"], region=row["region"], resource_arn=row["resource_arn"],
                 metric_unit=row["metric_unit"], period=row["period"], statistic=row["statistic"],
+                dataset_id=row["dataset_id"],
             ),
             predicted_is_anomaly=bool(row["predicted_is_anomaly"]), explanation=row["explanation"],
             detection_method=row["detection_method"], observed_value=row["metric_value"],

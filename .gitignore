@@ -9,3 +9,5 @@ dist/
 .vscode/
 data/raw/*.csv
 data/processed/*.csv
+data/*.sqlite
+backups/

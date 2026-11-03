@@ -11,13 +11,31 @@ from typing import Any, Iterable
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
+from dotenv import load_dotenv
+
+from anomaly_detector.utils.exceptions import ConfigurationError
 
 DEFAULT_SQLITE_PATH = Path("data/telemetry.sqlite")
 _ENGINES: dict[str, Engine] = {}
+load_dotenv()
+
+
+def _running_on_vercel() -> bool:
+    return os.getenv("VERCEL", "").strip().lower() in {"1", "true", "yes"}
 
 
 def database_target(target: str | Path | None = None) -> str:
-    value = target or os.getenv("DATABASE_URL") or os.getenv("ANOMALY_DATABASE_PATH")
+    if target is not None:
+        return str(target)
+    value = os.getenv("DATABASE_URL")
+    if value and value.strip():
+        return value.strip()
+    if _running_on_vercel():
+        raise ConfigurationError(
+            "DATABASE_URL must be configured in Vercel environment variables; "
+            "SQLite fallback is disabled on Vercel.",
+        )
+    value = os.getenv("ANOMALY_DATABASE_PATH")
     if value:
         return str(value)
     return str(DEFAULT_SQLITE_PATH)

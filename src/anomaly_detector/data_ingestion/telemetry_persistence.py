@@ -20,6 +20,7 @@ from anomaly_detector.data_ingestion.telemetry import TelemetryRecord
 from anomaly_detector.detection.generic_detector import GenericDetectionResult
 from anomaly_detector.detection.advanced_detector import AdvancedDetectionResult
 from anomaly_detector.utils.exceptions import DataIngestionError, DataValidationError
+from anomaly_detector.database import connect, database_target, is_postgresql
 
 SCHEMA_VERSION = 1
 CHECKPOINT_SCHEMA_VERSION = 1
@@ -318,7 +319,7 @@ _RESULT_TABLES = {"generic_detection_results"}
 _ADVANCED_RESULT_TABLES = {"advanced_detection_results"}
 _ALERT_TABLES = {"anomaly_alerts", "detection_configurations"}
 _INITIALIZATION_LOCK = threading.RLock()
-_INITIALIZED_DATABASES: set[Path] = set()
+_INITIALIZED_DATABASES: set[str] = set()
 
 
 def _json_value(value: Any) -> Any:
@@ -344,17 +345,17 @@ def _timestamp_text(timestamp: datetime) -> str:
 
 
 def _connect(database_path: str | Path) -> sqlite3.Connection:
-    path = Path(database_path)
-    if path.parent != Path(""):
-        path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=SQLITE_TIMEOUT_SECONDS)
-    connection.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MILLISECONDS}")
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.row_factory = sqlite3.Row
-    return connection
+    return connect(database_path)
 
 
 def _table_names(connection: sqlite3.Connection) -> set[str]:
+    if getattr(connection, "postgres", False):
+        return {
+            row[0]
+            for row in connection.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+            ).fetchall()
+        }
     return {
         row[0]
         for row in connection.execute(
@@ -372,10 +373,17 @@ def _validate_schema(connection: sqlite3.Connection, *, require_checkpoints: boo
     for table_name, required_columns in _REQUIRED_COLUMNS.items():
         if table_name not in required_tables:
             continue
-        columns = {
-            row[1]
-            for row in connection.execute(f"PRAGMA table_info({table_name})")
-        }
+        if getattr(connection, "postgres", False):
+            columns = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = ?",
+                    (table_name,),
+                ).fetchall()
+            }
+        else:
+            columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table_name})")}
         missing_columns = required_columns - columns
         if missing_columns:
             raise TelemetryPersistenceError(
@@ -388,16 +396,28 @@ def _validate_schema(connection: sqlite3.Connection, *, require_checkpoints: boo
         raise TelemetryPersistenceError(
             f"Unsupported telemetry schema version: {None if schema_row is None else schema_row[0]!r}",
         )
-    record_pk = connection.execute(
-        "SELECT pk FROM pragma_table_info('telemetry_records') WHERE name = 'datapoint_identity'",
-    ).fetchone()
-    unique_indexes = connection.execute("PRAGMA index_list(telemetry_records)").fetchall()
-    has_unique_identity = bool(record_pk and record_pk[0] == 1)
-    for index in unique_indexes:
-        if index[2]:
-            indexed_columns = [row[2] for row in connection.execute(f"PRAGMA index_info({index[1]})")]
-            if indexed_columns == ["datapoint_identity"]:
-                has_unique_identity = True
+    if getattr(connection, "postgres", False):
+        has_unique_identity = bool(connection.execute(
+            """SELECT 1 FROM information_schema.table_constraints tc
+               JOIN information_schema.key_column_usage kcu
+                 ON tc.constraint_name = kcu.constraint_name
+                AND tc.table_schema = kcu.table_schema
+              WHERE tc.table_schema = 'public'
+                AND tc.table_name = 'telemetry_records'
+                AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+                AND kcu.column_name = 'datapoint_identity'""",
+        ).fetchone())
+    else:
+        record_pk = connection.execute(
+            "SELECT pk FROM pragma_table_info('telemetry_records') WHERE name = 'datapoint_identity'",
+        ).fetchone()
+        unique_indexes = connection.execute("PRAGMA index_list(telemetry_records)").fetchall()
+        has_unique_identity = bool(record_pk and record_pk[0] == 1)
+        for index in unique_indexes:
+            if index[2]:
+                indexed_columns = [row[2] for row in connection.execute(f"PRAGMA index_info({index[1]})")]
+                if indexed_columns == ["datapoint_identity"]:
+                    has_unique_identity = True
     if not has_unique_identity:
         raise TelemetryPersistenceError("Incompatible telemetry database; datapoint identity is not unique.")
     if require_checkpoints:
@@ -416,6 +436,41 @@ def _initialize_database_once(database_path: str | Path) -> None:
     try:
         connection = _connect(database_path)
         existing_tables = _table_names(connection)
+        if getattr(connection, "postgres", False):
+            connection.execute("BEGIN")
+            for statement in _SCHEMA_STATEMENTS:
+                connection.execute(statement)
+            for table in (
+                "telemetry_records",
+                "generic_detection_results",
+                "advanced_detection_results",
+                "anomaly_alerts",
+            ):
+                if not connection.execute(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = ? AND column_name = 'dataset_id'",
+                    (table,),
+                ).fetchone():
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN dataset_id TEXT")
+            if not connection.execute(
+                "SELECT 1 FROM telemetry_schema WHERE schema_name = ?",
+                ("telemetry",),
+            ).fetchone():
+                connection.execute(
+                    "INSERT INTO telemetry_schema (schema_name, schema_version) VALUES (?, ?)",
+                    ("telemetry", SCHEMA_VERSION),
+                )
+            if not connection.execute(
+                "SELECT 1 FROM checkpoint_schema WHERE schema_name = ?",
+                ("checkpoints",),
+            ).fetchone():
+                connection.execute(
+                    "INSERT INTO checkpoint_schema (schema_name, schema_version) VALUES (?, ?)",
+                    ("checkpoints", CHECKPOINT_SCHEMA_VERSION),
+                )
+            connection.commit()
+            _validate_schema(connection)
+            return
         if existing_tables:
             connection.execute("BEGIN IMMEDIATE")
             migrations = {
@@ -487,26 +542,28 @@ def _initialize_database_once(database_path: str | Path) -> None:
 
 def initialize_database(database_path: str | Path) -> None:
     """Initialize or migrate one database once per process."""
-    path = Path(database_path).resolve()
+    target = database_target(database_path)
+    key = target if is_postgresql(target) else str(Path(target).resolve())
     with _INITIALIZATION_LOCK:
-        if path in _INITIALIZED_DATABASES:
-            connection = _connect(path)
+        if key in _INITIALIZED_DATABASES:
+            connection = _connect(target)
             try:
                 try:
                     _validate_schema(connection)
                 except TelemetryPersistenceError:
-                    _INITIALIZED_DATABASES.remove(path)
+                    _INITIALIZED_DATABASES.remove(key)
                 else:
                     return
             finally:
                 connection.close()
-        connection = _connect(path)
+        connection = _connect(target)
         try:
-            connection.execute("PRAGMA journal_mode = WAL")
+            if not getattr(connection, "postgres", False):
+                connection.execute("PRAGMA journal_mode = WAL")
         finally:
             connection.close()
-        _initialize_database_once(path)
-        _INITIALIZED_DATABASES.add(path)
+        _initialize_database_once(target)
+        _INITIALIZED_DATABASES.add(key)
 
 
 def persist_telemetry_records(

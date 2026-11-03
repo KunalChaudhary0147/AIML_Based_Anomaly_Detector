@@ -29,6 +29,7 @@ from anomaly_detector.alert_management import (
 )
 from anomaly_detector.data_ingestion.infrastructure_csv import load_infrastructure_csv
 from anomaly_detector.data_ingestion.telemetry_persistence import (
+    _connect,
     initialize_database,
     persist_advanced_detection_results,
     persist_generic_detection_results,
@@ -52,6 +53,7 @@ from anomaly_detector.historical import (
     retrieve_telemetry_history,
 )
 from anomaly_detector.utils.exceptions import DataIngestionError, DataValidationError
+from anomaly_detector.database import database_target
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
@@ -121,7 +123,16 @@ def _configuration_dict(configuration):
 
 def create_app(database_path: str | Path | None = None) -> FastAPI:
     """Create an API application with SQLite initialized during startup."""
-    resolved_database = Path(database_path or os.getenv("ANOMALY_DATABASE_PATH", "data/telemetry.sqlite"))
+    resolved_database = database_target(database_path)
+    cors_origins = [
+        origin.strip()
+        for origin in os.getenv(
+            "ANOMALY_CORS_ORIGINS",
+            "http://localhost:5173,http://127.0.0.1:5173",
+        ).split(",")
+        if origin.strip()
+    ]
+    cors_credentials = os.getenv("ANOMALY_CORS_ALLOW_CREDENTIALS", "false").lower() == "true"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -131,11 +142,8 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     app = FastAPI(title="AWS Anomaly Detector API", version="1.0.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-        ],
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=cors_credentials,
         allow_methods=["GET", "POST", "DELETE", "OPTIONS", "PUT", "PATCH", "HEAD"],
         allow_headers=["*"],
     )
@@ -157,10 +165,9 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     def health():
         database_status = "unavailable"
         try:
-            if resolved_database.exists():
-                with sqlite3.connect(resolved_database) as connection:
-                    connection.execute("SELECT 1")
-                database_status = "ok"
+            with _connect(resolved_database) as connection:
+                connection.execute("SELECT 1")
+            database_status = "ok"
         except sqlite3.Error:
             database_status = "unavailable"
         return {"status": "ok", "database": database_status}
@@ -305,7 +312,7 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     def dataset_stats():
         try:
             rows = list_datasets(resolved_database)
-            with sqlite3.connect(resolved_database) as connection:
+            with _connect(resolved_database) as connection:
                 total_entities, total_metrics = connection.execute(
                     "SELECT COUNT(DISTINCT entity_id), COUNT(DISTINCT metric_name) FROM telemetry_records"
                 ).fetchone()

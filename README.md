@@ -1,6 +1,6 @@
 # AWS Anomaly Detector
 
-Phase 1 is a tested foundation for synthetic weather data ingestion and anomaly-label preservation. Phase 2 adds a configurable rule-based detector and evaluation output. This project does not implement machine learning, AWS services, or deployment.
+Phase 1 is a tested foundation for synthetic weather data ingestion and anomaly-label preservation. Phase 2 adds a configurable rule-based detector and evaluation output. The API supports local SQLite and PostgreSQL deployment.
 
 ## Architecture
 
@@ -29,6 +29,40 @@ python -m venv .venv
 ```
 
 The package uses a `src` layout and editable installation. The documented commands below are run from the repository root.
+
+### Database configuration
+
+The backend uses `DATABASE_URL` when it is set. PostgreSQL URLs are accepted in
+the standard `postgresql://...` form and are connected through SQLAlchemy and
+psycopg with a small serverless-safe pool. If `DATABASE_URL` is unset, local
+development uses SQLite at `ANOMALY_DATABASE_PATH` (default:
+`data/telemetry.sqlite`). The application initializes the existing schema
+without deleting records; use a migration/backup procedure before moving an
+existing SQLite database to PostgreSQL.
+
+`ANOMALY_CORS_ORIGINS` is a comma-separated allowlist. Set it to the deployed
+frontend origin in production. `ANOMALY_CORS_ALLOW_CREDENTIALS` defaults to
+`false` and should only be enabled when the frontend actually uses
+credentialed requests.
+
+### Vercel deployment
+
+The existing FastAPI application is exposed through `api/index.py` and
+`vercel.json`; no second application is created. From the backend repository:
+
+1. Import the repository into Vercel and select the backend root directory.
+2. Set `DATABASE_URL` to a managed PostgreSQL connection string. Do not use a
+   local SQLite path in Vercel because function filesystems are ephemeral.
+3. Set `ANOMALY_CORS_ORIGINS` to the exact production frontend URL.
+4. Keep `ANOMALY_CORS_ALLOW_CREDENTIALS=false` unless credentialed browser
+   requests are required.
+5. Deploy and verify `/health`, `/api/v1/overview`, and a temporary CSV upload.
+
+Vercel Functions have a request-body limit of approximately 4.5 MB. The API's
+existing 10 MiB validation limit is intentionally not reduced, but uploads
+above Vercel's platform limit must use a separate object-storage/direct-upload
+flow or another ingestion service before calling this API. A Vercel deployment
+cannot safely rely on local files for durable uploads.
 
 ## Schema
 
